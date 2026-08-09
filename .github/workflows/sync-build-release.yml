@@ -188,11 +188,11 @@ jobs:
                   config: {wide_screen_mode: true},
                   header: {template: "green", title: {tag: "plain_text", content: $title}},
                   elements: [
-                    {tag: "div", text: {tag: "lark_md", content: "**上游新增内容**\n" + $commits}},
+                    {tag: "div", text: {tag: "lark_md", content: ("**上游新增内容**\n" + $commits)}},
                     {tag: "hr"},
                     {tag: "div", text: {tag: "lark_md", content: $detail}},
                     {tag: "hr"},
-                    {tag: "div", text: {tag: "lark_md", content: "**📦 下载地址**\n" + $links}},
+                    {tag: "div", text: {tag: "lark_md", content: ("**📦 下载地址**\n" + $links)}},
                     {tag: "action", actions: [{tag: "button", text: {tag: "plain_text", content: "打开 Release 页面"}, type: "primary", url: $release_url}]}
                   ]
                 }
