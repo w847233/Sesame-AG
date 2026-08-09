@@ -1,0 +1,224 @@
+name: Sync-Build-Release
+run-name: 同步上游 + 构建发布 ${{ github.event_name == 'schedule' && '(定时)' || '(手动)' }}
+
+on:
+  schedule:
+    # 每天 04:00 UTC = 北京时间 12:00
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制构建(即使上游无更新)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-build-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 同步上游
+    runs-on: ubuntu-latest
+    outputs:
+      has_update: ${{ steps.check.outputs.has_update }}
+      new_commits: ${{ steps.check.outputs.new_commits }}
+      commit_sha: ${{ steps.check.outputs.commit_sha }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 添加上游并检测更新
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "w847233"
+          git config user.email "w847233@users.noreply.github.com"
+          git remote add upstream https://github.com/Sesame-AG/Sesame-AG.git
+          git fetch upstream main
+          NEW=$(git rev-list --count HEAD..upstream/main 2>/dev/null || echo 0)
+          echo "上游新提交数: $NEW"
+          if [ "${NEW:-0}" -gt 0 ] || [ "${{ github.event.inputs.force }}" = "true" ]; then
+            # 生成新增提交列表(markdown 链接格式)
+            {
+              echo "new_commits<<EOF"
+              git log --format='- [%h](https://github.com/Sesame-AG/Sesame-AG/commit/%H) %s' HEAD..upstream/main | head -30
+              if [ "${NEW:-0}" -gt 30 ]; then echo "- ...共 ${NEW} 条提交"; fi
+              if [ "${{ github.event.inputs.force }}" = "true" ] && [ "${NEW:-0}" -eq 0 ]; then echo "- (手动强制构建,无上游新提交)"; fi
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            # 优先 fast-forward,失败(有分叉)则创建 merge commit
+            git merge --ff-only upstream/main 2>/dev/null || git merge --no-edit upstream/main
+            git push origin main
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-release:
+    name: 构建并发布
+    needs: sync
+    if: needs.sync.outputs.has_update == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_code: ${{ steps.version.outputs.version_code }}
+      tag: ${{ steps.release.outputs.tag }}
+      release_url: ${{ steps.release.outputs.release_url }}
+      apk_list: ${{ steps.artifacts.outputs.apk_list }}
+      apk_count: ${{ steps.artifacts.outputs.apk_count }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 设置 JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 设置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 提取版本号
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^[[:space:]]*versionName = "\(.*\)"/\1/p' app/build.gradle.kts)
+          VERSION_CODE=$(git rev-list --count HEAD)
+          echo "VERSION=$VERSION / CODE=$VERSION_CODE"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: 构建 Release APK(全部 ABI)
+        shell: bash
+        run: |
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: 收集构建产物信息
+        id: artifacts
+        shell: bash
+        run: |
+          cd app/build/outputs/apk/release
+          echo "--- APK 清单 ---"
+          ls -la *.apk
+          {
+            echo "apk_list<<EOF"
+            for f in *.apk; do
+              size=$(du -h "$f" | cut -f1)
+              echo "- **$f** — $size"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "apk_count=$(ls *.apk | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}-$(date +%Y%m%d-%H%M)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "# Sesame-AG 自动构建 v${{ steps.version.outputs.version }}"
+            echo ""
+            echo "- 版本号: v${{ steps.version.outputs.version }} (code ${{ steps.version.outputs.version_code }})"
+            echo "- 构建时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S') (北京时间)"
+            echo "- 架构: armeabi-v7a / arm64-v8a / x86 / x86_64 / universal"
+            echo ""
+            echo "## 上游更新内容"
+            echo "${{ needs.sync.outputs.new_commits }}"
+            echo ""
+            echo "## 构建产物"
+            echo "${{ steps.artifacts.outputs.apk_list }}"
+          } > /tmp/notes.md
+          cd app/build/outputs/apk/release
+          gh release create "$TAG" *.apk \
+            --repo w847233/Sesame-AG \
+            --title "Sesame-AG v${{ steps.version.outputs.version }} 自动构建" \
+            --notes-file /tmp/notes.md
+          echo "release_url=https://github.com/w847233/Sesame-AG/releases/tag/$TAG" >> "$GITHUB_OUTPUT"
+
+  notify:
+    name: 飞书通知
+    needs: [sync, build-release]
+    if: always() && needs.sync.outputs.has_update == 'true'
+    runs-on: ubuntu-latest
+    env:
+      FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+    steps:
+      - name: 发送飞书卡片
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_URL="https://github.com/w847233/Sesame-AG/actions/runs/${{ github.run_id }}"
+          SUCCESS="${{ needs.build-release.result == 'success' }}"
+
+          if [ "$SUCCESS" = "true" ]; then
+            TAG="${{ needs.build-release.outputs.tag }}"
+            # 构造 APK 直链列表
+            APK_LINKS=""
+            while IFS= read -r line; do
+              fname=$(echo "$line" | sed -E 's/^- \*\*([^*]+)\*\*.*/\1/')
+              [ -z "$fname" ] && continue
+              APK_LINKS="${APK_LINKS}[⬇️ $fname](https://github.com/w847233/Sesame-AG/releases/download/$TAG/$fname)\n"
+            done <<< "${{ needs.build-release.outputs.apk_list }}"
+
+            jq -n \
+              --arg title "✅ Sesame-AG 自动构建成功 v${{ needs.build-release.outputs.version }}" \
+              --arg commits "${{ needs.sync.outputs.new_commits }}" \
+              --arg detail "**版本**: v${{ needs.build-release.outputs.version }} (code ${{ needs.build-release.outputs.version_code }})\n**架构**: armeabi-v7a / arm64-v8a / x86 / x86_64 / universal\n**APK 数量**: ${{ needs.build-release.outputs.apk_count }}\n\n**构建详情**:\n${{ needs.build-release.outputs.apk_list }}" \
+              --arg links "$APK_LINKS" \
+              --arg release_url "${{ needs.build-release.outputs.release_url }}" \
+              '{
+                msg_type: "interactive",
+                card: {
+                  config: {wide_screen_mode: true},
+                  header: {template: "green", title: {tag: "plain_text", content: $title}},
+                  elements: [
+                    {tag: "div", text: {tag: "lark_md", content: "**上游新增内容**\n" + $commits}},
+                    {tag: "hr"},
+                    {tag: "div", text: {tag: "lark_md", content: $detail}},
+                    {tag: "hr"},
+                    {tag: "div", text: {tag: "lark_md", content: "**📦 下载地址**\n" + $links}},
+                    {tag: "action", actions: [{tag: "button", text: {tag: "plain_text", content: "打开 Release 页面"}, type: "primary", url: $release_url}]}
+                  ]
+                }
+              }' > /tmp/feishu.json
+          else
+            jq -n \
+              --arg title "❌ Sesame-AG 自动构建失败" \
+              --arg commits "${{ needs.sync.outputs.new_commits }}" \
+              --arg run_url "$RUN_URL" \
+              '{
+                msg_type: "interactive",
+                card: {
+                  config: {wide_screen_mode: true},
+                  header: {template: "red", title: {tag: "plain_text", content: $title}},
+                  elements: [
+                    {tag: "div", text: {tag: "lark_md", content: "**上游新增内容**\n" + $commits}},
+                    {tag: "hr"},
+                    {tag: "div", text: {tag: "lark_md", content: "构建或发布阶段失败,未生成 Release。\n请查看运行日志定位问题。"}},
+                    {tag: "action", actions: [{tag: "button", text: {tag: "plain_text", content: "查看运行日志"}, type: "danger", url: $run_url}]}
+                  ]
+                }
+              }' > /tmp/feishu.json
+          fi
+
+          RESP=$(curl -sS -X POST "$FEISHU_WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            --data-binary @/tmp/feishu.json)
+          echo "飞书响应: $RESP"
+          echo "$RESP" | grep -q '"StatusCode":0' || echo "⚠️ 飞书返回非 0 状态码"
