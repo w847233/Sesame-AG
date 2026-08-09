@@ -32,6 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: dev
 
       - name: 添加上游并检测更新
         id: check
@@ -41,21 +42,21 @@ jobs:
           git config user.name "w847233"
           git config user.email "w847233@users.noreply.github.com"
           git remote add upstream https://github.com/Sesame-AG/Sesame-AG.git
-          git fetch upstream main
-          NEW=$(git rev-list --count HEAD..upstream/main 2>/dev/null || echo 0)
+          git fetch upstream dev
+          NEW=$(git rev-list --count HEAD..upstream/dev 2>/dev/null || echo 0)
           echo "上游新提交数: $NEW"
           if [ "${NEW:-0}" -gt 0 ] || [ "${{ github.event.inputs.force }}" = "true" ]; then
             # 生成新增提交列表(markdown 链接格式)
             {
               echo "new_commits<<EOF"
-              git log --format='- [%h](https://github.com/Sesame-AG/Sesame-AG/commit/%H) %s' HEAD..upstream/main | head -30
+              git log --format='- [%h](https://github.com/Sesame-AG/Sesame-AG/commit/%H) %s' HEAD..upstream/dev | head -30
               if [ "${NEW:-0}" -gt 30 ]; then echo "- ...共 ${NEW} 条提交"; fi
               if [ "${{ github.event.inputs.force }}" = "true" ] && [ "${NEW:-0}" -eq 0 ]; then echo "- (手动强制构建,无上游新提交)"; fi
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
             # 优先 fast-forward,失败(有分叉)则创建 merge commit
-            git merge --ff-only upstream/main 2>/dev/null || git merge --no-edit upstream/main
-            git push origin main
+            git merge --ff-only upstream/dev 2>/dev/null || git merge --no-edit upstream/dev
+            git push origin dev
             echo "has_update=true" >> "$GITHUB_OUTPUT"
             echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           else
@@ -81,6 +82,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: dev
 
       - name: 设置 JDK 17
         uses: actions/setup-java@v5
