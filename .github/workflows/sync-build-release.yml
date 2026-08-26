@@ -54,11 +54,17 @@ jobs:
               if [ "${{ github.event.inputs.force }}" = "true" ] && [ "${NEW:-0}" -eq 0 ]; then echo "- (手动强制构建,无上游新提交)"; fi
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-            # 优先 fast-forward,失败(有分叉)则创建 merge commit
-            git merge --ff-only upstream/dev 2>/dev/null || git merge --no-edit upstream/dev
-            git push origin dev
+            # 只同步源码，保留 fork 自有工作流；GITHUB_TOKEN 无 workflows 权限，不能推送上游工作流文件
+            if [ "${NEW:-0}" -gt 0 ]; then
+              git merge --no-ff --no-commit upstream/dev
+              git restore --source=HEAD --staged --worktree -- .github/workflows
+              git commit --no-edit
+              git push origin dev
+              echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            else
+              echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            fi
             echo "has_update=true" >> "$GITHUB_OUTPUT"
-            echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           else
             echo "has_update=false" >> "$GITHUB_OUTPUT"
           fi
