@@ -1,11 +1,18 @@
 package io.github.aoguai.sesameag.task.exchange
 
 import com.fasterxml.jackson.core.type.TypeReference
+import io.github.aoguai.sesameag.hook.RequestManager
+import io.github.aoguai.sesameag.hook.rpc.RpcDailyCircuit
+import io.github.aoguai.sesameag.util.TimeUtil
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import io.github.aoguai.sesameag.entity.MapperEntity
 import io.github.aoguai.sesameag.util.Files
+import io.github.aoguai.sesameag.util.GlobalThreadPools
 import io.github.aoguai.sesameag.util.JsonUtil
 import io.github.aoguai.sesameag.util.Log
 import org.json.JSONObject
+import kotlin.random.Random
 
 enum class ExchangeSafety {
     AUTO,
@@ -332,23 +339,88 @@ class ExchangeOptionRow() : MapperEntity() {
     }
 }
 
+object ExchangeFetchPacing {
+
+    /**
+     * 兑换列表翻页间隔：固定基数加随机抖动，避免匀速翻页节奏
+     */
+    fun pageTurnDelay(baseMillis: Long = 1000L, jitterMillis: Long = 1200L) {
+        GlobalThreadPools.sleepCompat(baseMillis + Random.nextLong(0, jitterMillis + 1))
+    }
+
+    /**
+     * 兑换域刷新启动错开：多域同批刷新时打乱各域起跑时刻
+     */
+    fun domainStartDelay() {
+        GlobalThreadPools.sleepCompat(800L + Random.nextLong(0, 1701L))
+    }
+}
+
+data class ExchangeOptionsSnapshot(
+    val rows: List<ExchangeOptionRow>,
+    val payload: JSONObject
+)
+
 object ExchangeOptionsCache {
     private const val TAG = "ExchangeOptionsCache"
     private const val FILE_PREFIX = "exchange_options_"
     private const val FILE_SUFFIX = ".json"
     private const val CACHE_REASON = "本地缓存，未经过本次目标应用刷新复核"
 
-    fun save(userId: String?, target: String, rows: List<ExchangeOptionRow>): Boolean {
+    private val fetchLocks = ConcurrentHashMap<Pair<String, String>, Any>()
+
+    fun getOrFetch(
+        userId: String?,
+        target: String,
+        forceRefresh: Boolean = false,
+        fetch: () -> ExchangeOptionsSnapshot
+    ): ExchangeOptionsSnapshot {
         val normalizedUserId = userId?.trim().orEmpty()
-        if (normalizedUserId.isEmpty()) {
-            return false
+        val identity = RpcDailyCircuit.captureIdentity()
+        check(normalizedUserId.isNotEmpty() && identity.userId == normalizedUserId) { "兑换列表账号未就绪" }
+        return synchronized(fetchLocks.getOrPut(normalizedUserId to target) { Any() }) {
+            check(RpcDailyCircuit.isCurrent(identity)) { "兑换列表账号会话已变化" }
+            if (!forceRefresh) {
+                loadTodaySnapshot(normalizedUserId, target)?.let { return@synchronized it }
+            }
+            val refresh = {
+                val snapshot = fetch()
+                check(RpcDailyCircuit.isCurrent(identity)) { "兑换列表刷新期间账号会话已变化" }
+                val file = Files.getTargetFileofUser(normalizedUserId, fileName(target))
+                    ?: error("无法获取兑换列表缓存路径")
+                val temporary = File(file.parentFile, "${file.name}.tmp")
+                try {
+                    val body = JSONObject()
+                        .put("rows", org.json.JSONArray(JsonUtil.formatJson(snapshot.rows, false)))
+                        .put("payload", snapshot.payload)
+                        .toString()
+                    temporary.outputStream().use { output ->
+                        output.write(body.toByteArray(Charsets.UTF_8))
+                        output.fd.sync()
+                    }
+                    check(RpcDailyCircuit.isCurrent(identity)) { "兑换列表保存期间账号会话已变化" }
+                    android.system.Os.rename(temporary.absolutePath, file.absolutePath)
+                } finally {
+                    temporary.delete()
+                }
+                snapshot
+            }
+            if (forceRefresh) RequestManager.withExchangeSettingsRefresh(refresh) else refresh()
         }
+    }
+
+    fun loadTodaySnapshot(userId: String?, target: String): ExchangeOptionsSnapshot? {
+        val normalizedUserId = userId?.trim().orEmpty()
+        if (normalizedUserId.isEmpty()) return null
         return runCatching {
-            val file = Files.getTargetFileofUser(normalizedUserId, fileName(target)) ?: return false
-            Files.write2File(JsonUtil.formatJson(rows, false), file)
-        }.onFailure {
-            Log.printStackTrace(TAG, "save err:", it)
-        }.getOrDefault(false)
+            val file = Files.getTargetFileofUser(normalizedUserId, fileName(target)) ?: return null
+            if (!file.exists() || file.length() == 0L || !TimeUtil.isSameDay(file.lastModified(), System.currentTimeMillis())) return null
+            val json = JSONObject(Files.readFromFile(file))
+            ExchangeOptionsSnapshot(
+                JsonUtil.parseObject(json.getJSONArray("rows").toString(), object : TypeReference<List<ExchangeOptionRow>>() {}),
+                json.getJSONObject("payload")
+            )
+        }.onFailure { Log.printStackTrace(TAG, "loadTodaySnapshot err:", it) }.getOrNull()
     }
 
     fun load(userId: String?, target: String): List<ExchangeOptionRow> {
@@ -363,7 +435,7 @@ object ExchangeOptionsCache {
                 emptyList()
             } else {
                 JsonUtil.parseObject(
-                    body,
+                    if (body.trimStart().startsWith("[")) body else JSONObject(body).getJSONArray("rows").toString(),
                     object : TypeReference<List<ExchangeOptionRow>>() {}
                 ).filter { it.id.isNotBlank() }
             }

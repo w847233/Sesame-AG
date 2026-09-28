@@ -57,7 +57,9 @@ import io.github.aoguai.sesameag.task.exchange.ExchangeEffectNeed
 import io.github.aoguai.sesameag.task.exchange.ExchangeItem
 import io.github.aoguai.sesameag.task.exchange.ExchangeLimit
 import io.github.aoguai.sesameag.task.exchange.ExchangeOptionRow
+import io.github.aoguai.sesameag.task.exchange.ExchangeFetchPacing
 import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsCache
+import io.github.aoguai.sesameag.task.exchange.ExchangeOptionsSnapshot
 import io.github.aoguai.sesameag.task.exchange.ExchangeReplenishResult
 import io.github.aoguai.sesameag.task.exchange.ExchangeReplenisher
 import io.github.aoguai.sesameag.task.exchange.ExchangeSafety
@@ -1762,6 +1764,13 @@ class AntFarm : ModelTask() {
 
     private fun refreshIpChouChouLeExchangeOptionsForSettings(): List<MapperEntity> {
         val legacyRows = AntFarmIPChouChouLeBenefit.getList()
+        val freshRows = ExchangeOptionsCache.loadTodaySnapshot(
+            UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_FARM_IP_CHOUCHOULE
+        )?.rows
+        if (freshRows != null) {
+            Log.farm("IP抽抽乐商店💸设置页使用新鲜缓存#${freshRows.size}")
+            return freshRows
+        }
         if (!HookReadyChecker.isCurrentProcessReadyForRpc(UserMap.currentUid)) {
             val cachedRows = ExchangeOptionsCache.loadForSettingsCache(
                 UserMap.currentUid,
@@ -1819,8 +1828,8 @@ class AntFarm : ModelTask() {
         return rows
     }
 
-    internal fun refreshIpChouChouLeExchangeOptionsForRemote(): List<ExchangeOptionRow> =
-        ChouChouLe().refreshIpChouChouLeExchangeOptionsFromRpc()
+    internal fun refreshIpChouChouLeExchangeOptionsForRemote(forceRefresh: Boolean = false): List<ExchangeOptionRow> =
+        ChouChouLe().refreshIpChouChouLeExchangeOptionsFromRpc(forceRefresh)
 
 
     private fun buildParadiseCoinExchangeItem(
@@ -1868,6 +1877,13 @@ class AntFarm : ModelTask() {
     }
 
     private fun refreshParadiseCoinExchangeOptionsForSettings(): List<MapperEntity> {
+        val freshRows = ExchangeOptionsCache.loadTodaySnapshot(
+            UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_FARM_PARADISE
+        )?.rows
+        if (freshRows != null) {
+            Log.farm("小鸡乐园币💸设置页使用新鲜缓存#${freshRows.size}")
+            return freshRows
+        }
         if (!HookReadyChecker.isCurrentProcessReadyForRpc(UserMap.currentUid)) {
             val cachedRows = ExchangeOptionsCache.loadForSettingsCache(
                 UserMap.currentUid,
@@ -1914,14 +1930,24 @@ class AntFarm : ModelTask() {
         return rows
     }
 
-    private fun refreshParadiseCoinExchangeOptionsFromRpc(): List<ExchangeOptionRow> {
+    private fun refreshParadiseCoinExchangeOptionsFromRpc(): List<ExchangeOptionRow> =
+        queryParadiseCoinExchangeSnapshot().rows
+
+    private fun queryParadiseCoinExchangeSnapshot(
+        forceRefresh: Boolean = false,
+        onFailure: ((TaskFlowActionResult) -> Unit)? = null
+    ): ExchangeOptionsSnapshot = ExchangeOptionsCache.getOrFetch(
+        UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_FARM_PARADISE, forceRefresh
+    ) {
         try {
+            ExchangeFetchPacing.domainStartDelay()
             val jo = JSONObject(AntFarmRpcCall.getMallHome())
             if (!ResChecker.checkRes(TAG, jo)) {
+                onFailure?.invoke(farmResourceFailure("getMallHome", jo))
                 Log.error(TAG, "小鸡乐园币💸[设置页刷新权益列表失败]")
                 throw IllegalStateException("小鸡乐园币刷新权益列表失败")
             }
-            val mallItemSimpleList = jo.optJSONArray("mallItemSimpleList") ?: return emptyList()
+            val mallItemSimpleList = jo.optJSONArray("mallItemSimpleList") ?: throw IllegalStateException("小鸡乐园币兑换列表缺少 mallItemSimpleList")
             val benefitMap = IdMapManager.getInstance(ParadiseCoinBenefitIdMap::class.java)
             val rows = mutableListOf<ExchangeOptionRow>()
             for (i in 0..<mallItemSimpleList.length()) {
@@ -1939,16 +1965,15 @@ class AntFarm : ModelTask() {
                 rows.add(exchangeItem.toOptionRow())
             }
             benefitMap.save(UserMap.currentUid)
-            ExchangeOptionsCache.save(UserMap.currentUid, ExchangeOptionsRefreshBridge.TARGET_FARM_PARADISE, rows)
-            return rows
+            ExchangeOptionsSnapshot(rows, jo)
         } catch (t: Throwable) {
             Log.printStackTrace(TAG, "refreshParadiseCoinExchangeOptionsFromRpc err:", t)
             throw t
         }
     }
 
-    internal fun refreshParadiseCoinExchangeOptionsForRemote(): List<ExchangeOptionRow> =
-        refreshParadiseCoinExchangeOptionsFromRpc()
+    internal fun refreshParadiseCoinExchangeOptionsForRemote(forceRefresh: Boolean = false): List<ExchangeOptionRow> =
+        queryParadiseCoinExchangeSnapshot(forceRefresh).rows
 
     internal fun replenishExchangeByNeed(
         need: ExchangeEffectNeed,
@@ -1965,11 +1990,12 @@ class AntFarm : ModelTask() {
             ?.filter { it.isNotEmpty() }
             ?.toSet()
             ?: emptySet()
-        if (selectedIds.isEmpty()) {
-            return ExchangeReplenishResult.NOT_SELECTED
-        }
+        var queryFailure: TaskFlowActionResult? = null
         return runCatching {
-            val jo = JSONObject(AntFarmRpcCall.getMallHome())
+            val jo = queryParadiseCoinExchangeSnapshot(onFailure = {
+                queryFailure = it
+                onFailure?.invoke(it)
+            }).payload
             if (!ResChecker.checkRes(TAG, jo)) {
                 onFailure?.invoke(farmResourceFailure("getMallHome", jo))
                 return@runCatching ExchangeReplenishResult.RETRY_LATER
@@ -2029,7 +2055,7 @@ class AntFarm : ModelTask() {
             }
         }.onFailure {
             if (it is CancellationException) throw it
-            onFailure?.invoke(TaskFlowActionResult.failure(TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
+            if (queryFailure == null) onFailure?.invoke(TaskFlowActionResult.failure(TaskRpcFailureType.UNKNOWN_NEEDS_REVIEW,
                 rpc = "replenishParadiseExchangeByNeed", message = it.message.orEmpty(), raw = it.toString()))
             Log.printStackTrace(TAG, "replenishParadiseExchangeByNeed err:", it)
         }.getOrDefault(ExchangeReplenishResult.RETRY_LATER)
@@ -2037,7 +2063,7 @@ class AntFarm : ModelTask() {
 
     internal suspend fun paradiseCoinExchangeBenefit() {
         try {
-            val jo = JSONObject(AntFarmRpcCall.getMallHome())
+            val jo = queryParadiseCoinExchangeSnapshot().payload
 
             if (!ResChecker.checkRes(TAG, jo)) {
                 Log.error(TAG, "小鸡乐园币💸[未获取到可兑换权益]")
